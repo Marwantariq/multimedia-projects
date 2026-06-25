@@ -1,0 +1,49 @@
+import gradio as gr
+import cv2
+import numpy as np
+import tensorflow as tf
+
+model_path = "pet_detector.keras" 
+try:
+    model = tf.keras.models.load_model(model_path, compile=False)
+except Exception as e:
+    print(f"Error loading model: {e}. Please ensure the path is correct and the file is in the same folder.")
+
+def predict_and_draw(image):
+    if image is None:
+        return None
+
+    original_h, original_w = image.shape[:2]
+
+    img_resized = cv2.resize(image, (224, 224))
+
+    img_normalized = img_resized / 255.0
+
+    img_batch = np.expand_dims(img_normalized, axis=0)
+
+    predictions = model.predict(img_batch)[0] 
+
+    xmin = int(predictions[0] * original_w)
+    ymin = int(predictions[1] * original_h)
+    xmax = int(predictions[2] * original_w)
+    ymax = int(predictions[3] * original_h)
+
+    output_image = image.copy()
+    cv2.rectangle(output_image, (xmin, ymin), (xmax, ymax), (255, 0, 0), 3)
+
+    return output_image
+
+demo = gr.Interface(
+    fn=predict_and_draw,                 
+
+    inputs=gr.Image(type="numpy"),       
+
+    outputs=gr.Image(type="numpy"),      
+
+    title="📸 Pet Detector AI",
+    description="Upload a picture of a cat or dog, and the model will draw a bounding box around it!",
+    flagging_mode="never"
+)
+
+if __name__ == "__main__":
+    demo.launch(share=True)
