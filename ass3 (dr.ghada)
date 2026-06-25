@@ -1,0 +1,445 @@
+import os
+import sys
+import random
+import shutil
+from pathlib import Path
+import numpy as np
+import pandas as pd
+from PIL import Image
+from tqdm import tqdm  # Standard tqdm for clean text output
+import matplotlib.pyplot as plt
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torchvision import transforms, models, datasets
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix
+#%%
+# Configuration
+class Args:
+    data_dir = '/kaggle/input/datasets/ggez690/mstar-ready/data'
+    batch_size = 64
+    epochs_a = 25
+    epochs_b = 30
+    base_lr = 1e-4
+    backbone_lr = 1e-5
+    weight_decay = 1e-4
+    seed = 42
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+args = Args()
+print(f"Using device: {args.device}")
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+set_seed(args.seed)
+#%%
+# Kaggle-Specific Dataset Splitter
+def ensure_dataset_structure(source_root, writable_dir='/kaggle/working/split_data'):
+    source_root = Path(source_root)
+    if not source_root.exists():
+        raise FileNotFoundError(f"Dataset root {source_root} not found. Check your Kaggle input path.")
+    
+    if (source_root / 'train').exists() and (source_root / 'val').exists() and (source_root / 'test').exists():
+        print(f"Found existing split in {source_root}. Using directly.")
+        return str(source_root / 'train'), str(source_root / 'val'), str(source_root / 'test')
+    
+    print(f"No split found in input. Creating split in writable directory: {writable_dir}...")
+    working_root = Path(writable_dir)
+    train_dir = working_root / 'train'
+    val_dir = working_root / 'val'
+    test_dir = working_root / 'test'
+    
+    if train_dir.exists():
+        print("Split already generated in working directory. Skipping copy.")
+        return str(train_dir), str(val_dir), str(test_dir)
+        
+    train_dir.mkdir(parents=True, exist_ok=True)
+    val_dir.mkdir(parents=True, exist_ok=True)
+    test_dir.mkdir(parents=True, exist_ok=True)
+    
+    classes = [p for p in source_root.iterdir() if p.is_dir()]
+    
+    for cls in classes:
+        imgs = [p for p in cls.iterdir() if p.is_file()]
+        if not imgs: continue
+        
+        random.shuffle(imgs)
+        n = len(imgs)
+        n_train = int(0.7 * n)
+        n_val = int(0.15 * n)
+        
+        (train_dir / cls.name).mkdir(parents=True, exist_ok=True)
+        (val_dir / cls.name).mkdir(parents=True, exist_ok=True)
+        (test_dir / cls.name).mkdir(parents=True, exist_ok=True)
+        
+        for i, img in enumerate(imgs):
+            if i < n_train:
+                shutil.copy(img, train_dir / cls.name / img.name)
+            elif i < n_train + n_val:
+                shutil.copy(img, val_dir / cls.name / img.name)
+            else:
+                shutil.copy(img, test_dir / cls.name / img.name)
+                
+    return str(train_dir), str(val_dir), str(test_dir)
+
+def compute_mean_std(dataset):
+    loader = DataLoader(dataset, batch_size=64, num_workers=0, shuffle=False)
+    mean, std, nb_samples = 0., 0., 0
+    for data, _ in loader:
+        batch_samples = data.size(0)
+        data = data.view(batch_samples, data.size(1), -1)
+        mean += data.mean(2).sum(0)
+        std += data.std(2).sum(0)
+        nb_samples += batch_samples
+    return (mean / nb_samples).numpy().tolist(), (std / nb_samples).numpy().tolist()
+#%%
+# Create Datasets and Dataloaders
+train_root, val_root, test_root = ensure_dataset_structure(args.data_dir)
+
+basic_transform = transforms.Compose([
+    transforms.Grayscale(num_output_channels=1),
+    transforms.Resize((128,128)),
+    transforms.ToTensor()
+])
+
+train_dataset_basic = datasets.ImageFolder(train_root, transform=basic_transform)
+mean, std = compute_mean_std(train_dataset_basic)
+print("Computed mean/std:", mean, std)
+
+train_transform = transforms.Compose([
+    transforms.Grayscale(num_output_channels=1),
+    transforms.RandomResizedCrop(128, scale=(0.8,1.0)),
+    transforms.RandomRotation(15),
+    transforms.RandomHorizontalFlip(),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=mean, std=std)
+])
+
+val_transform = transforms.Compose([
+    transforms.Grayscale(num_output_channels=1),
+    transforms.Resize((128,128)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=mean, std=std)
+])
+
+train_dataset = datasets.ImageFolder(train_root, transform=train_transform)
+val_dataset = datasets.ImageFolder(val_root, transform=val_transform)
+test_dataset = datasets.ImageFolder(test_root, transform=val_transform)
+
+num_classes = len(train_dataset.classes)
+class_names = train_dataset.classes
+print("Classes detected:", class_names)
+
+train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0, pin_memory=True)
+val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0, pin_memory=True)
+test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0, pin_memory=True)
+#%%
+# Evaluation Helper
+def evaluate_model(model, loader, device):
+    model.eval()
+    preds, targets, losses = [], [], []
+    criterion = nn.CrossEntropyLoss()
+    with torch.no_grad():
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            out = model(x)
+            loss = criterion(out, y)
+            losses.append(loss.item() * x.size(0))
+            preds.append(out.argmax(1).cpu().numpy())
+            targets.append(y.cpu().numpy())
+            
+    if len(preds) > 0:
+        preds = np.concatenate(preds)
+        targets = np.concatenate(targets)
+        loss = np.sum(losses) / len(loader.dataset)
+        acc = accuracy_score(targets, preds)
+        prec, rec, f1, _ = precision_recall_fscore_support(targets, preds, average='macro', zero_division=0)
+    else:
+        loss, acc, prec, rec, f1 = 0, 0, 0, 0, 0
+        
+    return {'loss': loss, 'acc': acc, 'f1_macro': f1, 'preds': preds, 'targets': targets}
+#%%
+# Trial A: Fine-tune ResNet18
+def adapt_resnet18_single_channel(num_classes, device):
+    model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+    w = model.conv1.weight.data
+    if w.shape[1] != 1:
+        new_w = w.mean(dim=1, keepdim=True)
+        model.conv1 = nn.Conv2d(1, model.conv1.out_channels, kernel_size=model.conv1.kernel_size,
+                                stride=model.conv1.stride, padding=model.conv1.padding, bias=(model.conv1.bias is not None))
+        model.conv1.weight.data = new_w
+    model.fc = nn.Linear(model.fc.in_features, num_classes)
+    return model.to(device)
+
+def train_trialA(train_loader, val_loader, test_loader, num_classes, class_names, device, args):
+    model = adapt_resnet18_single_channel(num_classes, device)
+    criterion = nn.CrossEntropyLoss()
+    
+    for name, param in model.named_parameters():
+        if not name.startswith('fc'):
+            param.requires_grad = False
+            
+    optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.base_lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=3, factor=0.5)
+    
+    best_val_f1 = 0.0
+    best_epoch = -1
+    patience_counter = 0
+    logs = []
+    total_epochs = args.epochs_a
+    
+    for epoch in range(total_epochs):
+        model.train()
+        running_loss = 0.0
+        all_preds, all_targets = [], []
+        # Removed 'leave=False' to stop tqdm from overwriting lines
+        for x, y in tqdm(train_loader, desc=f"TrialA Epoch {epoch+1}/{total_epochs}"):
+            x, y = x.to(device), y.to(device)
+            optimizer.zero_grad()
+            out = model(x)
+            loss = criterion(out, y)
+            loss.backward()
+            optimizer.step()
+            
+            running_loss += loss.item() * x.size(0)
+            all_preds.append(out.argmax(1).cpu().numpy())
+            all_targets.append(y.cpu().numpy())
+            
+        train_loss = running_loss / len(train_loader.dataset)
+        train_preds = np.concatenate(all_preds)
+        train_targets = np.concatenate(all_targets)
+        train_acc = accuracy_score(train_targets, train_preds)
+        
+        val_res = evaluate_model(model, val_loader, device)
+        scheduler.step(val_res['loss'])
+        logs.append({'epoch': epoch+1, 'train_loss': train_loss, 'val_loss': val_res['loss'], 'train_acc': train_acc, 'val_acc': val_res['acc'], 'val_f1_macro': val_res['f1_macro']})
+        print(f"\n>>> Epoch {epoch+1} Summary: Train Loss: {train_loss:.4f} | Val Loss: {val_res['loss']:.4f} | Val Acc: {val_res['acc']:.4f} | Val F1: {val_res['f1_macro']:.4f}\n")
+        
+        if epoch == 2:
+            for name, param in model.named_parameters():
+                param.requires_grad = True
+            optimizer = torch.optim.Adam(model.parameters(), lr=args.backbone_lr, weight_decay=args.weight_decay)
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=3, factor=0.5)
+            print(">>> Unfroze all layers. Switched to backbone_lr.\n")
+            
+        if val_res['f1_macro'] > best_val_f1:
+            best_val_f1 = val_res['f1_macro']
+            best_epoch = epoch+1
+            torch.save({'model_state': model.state_dict(), 'epoch': epoch+1, 'val_f1': best_val_f1}, '/kaggle/working/trialA_best.pth')
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            
+        if patience_counter >= 8:
+            print("Early stopping Trial A triggered.\n")
+            break
+            
+    df = pd.DataFrame(logs)
+    df.to_csv('/kaggle/working/trialA_log.csv', index=False)
+    
+    best_ckpt = torch.load('/kaggle/working/trialA_best.pth', map_location=device)
+    model.load_state_dict(best_ckpt['model_state'])
+    test_res = evaluate_model(model, test_loader, device)
+    
+    cm = confusion_matrix(test_res['targets'], test_res['preds'])
+    plt.figure(figsize=(8,6))
+    plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+    plt.title('Trial A Confusion Matrix')
+    plt.colorbar()
+    tick_marks = np.arange(num_classes)
+    plt.xticks(tick_marks, class_names, rotation=45)
+    plt.yticks(tick_marks, class_names)
+    plt.ylabel('True label')
+    plt.xlabel('Predicted label')
+    plt.tight_layout()
+    plt.savefig('/kaggle/working/trialA_confusion.png', dpi=200)
+    plt.show()
+    
+    plt.figure()
+    plt.plot(df['epoch'], df['train_loss'], label='train_loss')
+    plt.plot(df['epoch'], df['val_loss'], label='val_loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.title('Trial A Loss Curves')
+    plt.savefig('/kaggle/working/trialA_loss.png', dpi=200)
+    plt.show()
+    
+    return {'best_epoch': best_epoch, 'best_val_f1': best_val_f1, 'best_val_acc': df.loc[df['epoch']==best_epoch,'val_acc'].values[0] if best_epoch>0 else None}
+#%%
+# Run Trial A
+resA = train_trialA(train_loader, val_loader, test_loader, num_classes, class_names, args.device, args)
+print(f"Trial A Best Epoch: {resA['best_epoch']} | Val F1: {resA['best_val_f1']:.4f} | Val Acc: {resA['best_val_acc']:.4f}")
+#%%
+# Trial B: New model initialized from ResNet18 weights
+class NewCNN(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        self.conv1 = nn.Conv2d(1, 32, 3, padding=1);  self.bn1 = nn.BatchNorm2d(32)
+        self.conv2 = nn.Conv2d(32, 32, 3, padding=1); self.bn2 = nn.BatchNorm2d(32)
+        self.conv3 = nn.Conv2d(32, 64, 3, padding=1); self.bn3 = nn.BatchNorm2d(64)
+        self.conv4 = nn.Conv2d(64, 64, 3, padding=1); self.bn4 = nn.BatchNorm2d(64)
+        self.conv5 = nn.Conv2d(64, 128, 3, padding=1); self.bn5 = nn.BatchNorm2d(128)
+        self.conv6 = nn.Conv2d(128, 128, 3, padding=1); self.bn6 = nn.BatchNorm2d(128)
+        self.conv7 = nn.Conv2d(128, 256, 3, padding=1); self.bn7 = nn.BatchNorm2d(256)
+        self.conv8 = nn.Conv2d(256, 256, 3, padding=1); self.bn8 = nn.BatchNorm2d(256)
+        self.conv9 = nn.Conv2d(256, 256, 3, padding=1); self.bn9 = nn.BatchNorm2d(256)
+        self.conv10 = nn.Conv2d(256, 256, 3, padding=1); self.bn10 = nn.BatchNorm2d(256)
+        
+        self.pool = nn.MaxPool2d(2,2)
+        self.avgpool = nn.AdaptiveAvgPool2d((1,1))
+        self.fc1 = nn.Linear(256, 128)
+        self.fc2 = nn.Linear(128, num_classes)
+
+    def forward(self, x):
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = self.pool(x)
+        x = F.relu(self.bn3(self.conv3(x)))
+        x = F.relu(self.bn4(self.conv4(x)))
+        x = self.pool(x)
+        x = F.relu(self.bn5(self.conv5(x)))
+        x = F.relu(self.bn6(self.conv6(x)))
+        x = self.pool(x)
+        x = F.relu(self.bn7(self.conv7(x)))
+        x = F.relu(self.bn8(self.conv8(x)))
+        x = F.relu(self.bn9(self.conv9(x)))
+        x = F.relu(self.bn10(self.conv10(x)))
+        x = self.avgpool(x)
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x
+
+def init_newcnn_from_resnet(new_model, device):
+    resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+    with torch.no_grad():
+        for m in new_model.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                if m.bias is not None: nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.kaiming_uniform_(m.weight, a=np.sqrt(5))
+                if m.bias is not None: nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+                
+        try:
+            r_w = resnet.conv1.weight.data  
+            r_w_avg = r_w.mean(dim=1, keepdim=True)  
+            center = r_w_avg[:,:,2:5,2:5]  
+            n_out = new_model.conv1.weight.shape[0]
+            mapped = center[:n_out,:,:,:]
+            if mapped.shape == new_model.conv1.weight.shape:
+                new_model.conv1.weight.data.copy_(mapped)
+        except Exception: pass
+            
+        try:
+            r_c = resnet.layer1[0].conv1.weight.data
+            if new_model.conv3.weight.shape == r_c.shape: new_model.conv3.weight.data.copy_(r_c)
+        except Exception: pass
+            
+        try:
+            r_c2 = resnet.layer1[0].conv2.weight.data
+            if new_model.conv4.weight.shape == r_c2.shape: new_model.conv4.weight.data.copy_(r_c2)
+        except Exception: pass
+            
+    return new_model.to(device)
+
+def train_trialB(train_loader, val_loader, test_loader, num_classes, class_names, device, args):
+    model = NewCNN(num_classes).to(device)
+    model = init_newcnn_from_resnet(model, device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.base_lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=3, factor=0.5)
+    
+    best_val_f1 = 0.0
+    best_epoch = -1
+    patience_counter = 0
+    logs = []
+    total_epochs = args.epochs_b
+    
+    for epoch in range(total_epochs):
+        model.train()
+        running_loss = 0.0
+        all_preds, all_targets = [], []
+        for x, y in tqdm(train_loader, desc=f"TrialB Epoch {epoch+1}/{total_epochs}"):
+            x, y = x.to(device), y.to(device)
+            optimizer.zero_grad()
+            out = model(x)
+            loss = criterion(out, y)
+            loss.backward()
+            optimizer.step()
+            
+            running_loss += loss.item() * x.size(0)
+            all_preds.append(out.argmax(1).cpu().numpy())
+            all_targets.append(y.cpu().numpy())
+            
+        train_loss = running_loss / len(train_loader.dataset)
+        train_preds = np.concatenate(all_preds)
+        train_targets = np.concatenate(all_targets)
+        train_acc = accuracy_score(train_targets, train_preds)
+        
+        val_res = evaluate_model(model, val_loader, device)
+        scheduler.step(val_res['loss'])
+        logs.append({'epoch': epoch+1, 'train_loss': train_loss, 'val_loss': val_res['loss'], 'train_acc': train_acc, 'val_acc': val_res['acc'], 'val_f1_macro': val_res['f1_macro']})
+        print(f"\n>>> Epoch {epoch+1} Summary: Train Loss: {train_loss:.4f} | Val Loss: {val_res['loss']:.4f} | Val Acc: {val_res['acc']:.4f} | Val F1: {val_res['f1_macro']:.4f}\n")
+        
+        if val_res['f1_macro'] > best_val_f1:
+            best_val_f1 = val_res['f1_macro']
+            best_epoch = epoch+1
+            torch.save({'model_state': model.state_dict(), 'epoch': epoch+1, 'val_f1': best_val_f1}, '/kaggle/working/trialB_best.pth')
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            
+        if patience_counter >= 8:
+            print("Early stopping Trial B triggered.\n")
+            break
+            
+    df = pd.DataFrame(logs)
+    df.to_csv('/kaggle/working/trialB_log.csv', index=False)
+    
+    best_ckpt = torch.load('/kaggle/working/trialB_best.pth', map_location=device)
+    model.load_state_dict(best_ckpt['model_state'])
+    test_res = evaluate_model(model, test_loader, device)
+    
+    cm = confusion_matrix(test_res['targets'], test_res['preds'])
+    plt.figure(figsize=(8,6))
+    plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+    plt.title('Trial B Confusion Matrix')
+    plt.colorbar()
+    tick_marks = np.arange(num_classes)
+    plt.xticks(tick_marks, class_names, rotation=45)
+    plt.yticks(tick_marks, class_names)
+    plt.ylabel('True label')
+    plt.xlabel('Predicted label')
+    plt.tight_layout()
+    plt.savefig('/kaggle/working/trialB_confusion.png', dpi=200)
+    plt.show()
+    
+    plt.figure()
+    plt.plot(df['epoch'], df['train_loss'], label='train_loss')
+    plt.plot(df['epoch'], df['val_loss'], label='val_loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.title('Trial B Loss Curves')
+    plt.savefig('/kaggle/working/trialB_loss.png', dpi=200)
+    plt.show()
+    
+    return {'best_epoch': best_epoch, 'best_val_f1': best_val_f1, 'best_val_acc': df.loc[df['epoch']==best_epoch,'val_acc'].values[0] if best_epoch>0 else None}
+#%%
+# Run Trial B
+resB = train_trialB(train_loader, val_loader, test_loader, num_classes, class_names, args.device, args)
+print(f"Trial B Best Epoch: {resB['best_epoch']} | Val F1: {resB['best_val_f1']:.4f} | Val Acc: {resB['best_val_acc']:.4f}")
