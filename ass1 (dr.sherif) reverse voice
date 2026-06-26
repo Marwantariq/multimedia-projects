@@ -1,0 +1,90 @@
+import wave
+import numpy as np
+import os
+import sys
+
+def wav_info(filepath: str):
+    """Read a .wav file and print its metadata."""
+
+    if not os.path.exists(filepath):
+        print(f"Error: File '{filepath}' not found.")
+        return
+
+    with wave.open(filepath, 'rb') as wf:
+        n_channels    = wf.getnchannels()      
+        sample_width  = wf.getsampwidth()      
+        frame_rate    = wf.getframerate()      
+        n_frames      = wf.getnframes()        
+        raw_data      = wf.readframes(n_frames)
+
+    bit_depth        = sample_width * 8                          
+    total_samples    = n_frames * n_channels                     
+    data_size_bytes  = len(raw_data)                             
+    data_size_bits   = data_size_bytes * 8
+    channel_type     = "Mono" if n_channels == 1 else "Stereo"
+    duration_sec     = n_frames / frame_rate
+
+    bit_rate_bps     = frame_rate * bit_depth * n_channels
+
+    print("=" * 45)
+    print("         WAV File Information")
+    print("=" * 45)
+    print(f"  File             : {os.path.basename(filepath)}")
+    print(f"  Type             : {channel_type}")
+    print(f"  Sampling Rate    : {frame_rate:,} Hz")
+    print(f"  Bit Depth        : {bit_depth} bit")
+    print(f"  Bit Rate         : {bit_rate_bps:,} bps  ({bit_rate_bps/1000:.1f} kbps)")
+    print(f"  Total Samples    : {total_samples:,}  (per-channel: {n_frames:,})")
+    print(f"  Data Size        : {data_size_bytes:,} bytes  /  {data_size_bits:,} bits")
+    print(f"  Duration         : {duration_sec:.3f} sec")
+    print("=" * 45)
+
+    return {
+        "n_channels": n_channels,
+        "sample_width": sample_width,
+        "frame_rate": frame_rate,
+        "n_frames": n_frames,
+        "raw_data": raw_data,
+        "bit_depth": bit_depth,
+        "total_samples": total_samples,
+        "data_size_bytes": data_size_bytes,
+        "data_size_bits": data_size_bits,
+        "bit_rate_bps": bit_rate_bps,
+        "channel_type": channel_type,
+    }
+
+
+def reverse_wav(filepath: str, output_path: str = None):
+    """Reverse a .wav file sample-by-sample and save as a new .wav."""
+
+    info = wav_info(filepath)
+    if info is None:
+        return
+
+    dtype_map = {1: np.int8, 2: np.int16, 4: np.int32}
+    dtype = dtype_map.get(info["sample_width"])
+    if dtype is None:
+        print(f"Unsupported sample width: {info['sample_width']} bytes")
+        return
+
+    samples = np.frombuffer(info["raw_data"], dtype=dtype)
+
+    samples = samples.reshape(-1, info["n_channels"])
+
+    reversed_samples = samples[::-1, :]
+
+    if output_path is None:
+        base, ext = os.path.splitext(filepath)
+        output_path = base + "_reversed" + ext
+
+    with wave.open(output_path, 'wb') as wf_out:
+        wf_out.setnchannels(info["n_channels"])
+        wf_out.setsampwidth(info["sample_width"])
+        wf_out.setframerate(info["frame_rate"])
+        wf_out.writeframes(reversed_samples.tobytes())
+
+    print(f"\n✅ Reversed file saved → {output_path}")
+
+
+if __name__ == "__main__":
+    reverse_wav("test.wav")
